@@ -350,6 +350,349 @@ describe("responses-field-backfill", () => {
     expect(result.output[0].id).toBe("msg_real");
   });
 
+  test("backfills missing status on output_item.done message", () => {
+    const event = {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "msg_1",
+        role: "assistant",
+        content: [{ type: "output_text", text: "hi" }],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.item.status).toBe("completed");
+  });
+
+  test("preserves existing status on message items", () => {
+    const event = {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "msg_1",
+        role: "assistant",
+        status: "in_progress",
+        content: [{ type: "output_text", text: "hi" }],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.item.status).toBe("in_progress");
+  });
+
+  test("backfills missing status on response.completed output items", () => {
+    const event = {
+      type: "response.completed",
+      sequence_number: 42,
+      response: {
+        id: "resp_1",
+        object: "response",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "output_text", text: "hello" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.output[0].status).toBe("completed");
+  });
+
+  test("does not add status to non-message items", () => {
+    const event = {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_1",
+        call_id: "call_1",
+        name: "do_thing",
+        arguments: "{}",
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.item).not.toHaveProperty("status");
+  });
+
+  test("backfillResponsesFieldsJson backfills missing status on message items", () => {
+    const response = {
+      id: "resp_1",
+      object: "response",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          id: "msg_1",
+          role: "assistant",
+          content: [{ type: "output_text", text: "hello" }],
+        },
+      ],
+    };
+    const result = JSON.parse(backfillResponsesFieldsJson(JSON.stringify(response))) as typeof response;
+    expect(result.output[0].status).toBe("completed");
+  });
+
+  test("backfills missing created_at on response.completed", () => {
+    const event = {
+      type: "response.completed",
+      sequence_number: 42,
+      response: {
+        id: "resp_1",
+        object: "response",
+        status: "completed",
+        model: "grok-4.5",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "answer" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.created_at).toEqual(expect.any(Number));
+    expect(parsed.response.created_at).toBeGreaterThan(0);
+  });
+
+  test("preserves existing created_at on response objects", () => {
+    const event = {
+      type: "response.created",
+      sequence_number: 1,
+      response: {
+        id: "resp_1",
+        object: "response",
+        created_at: 1700000000,
+        status: "in_progress",
+        model: "grok-4.5",
+        output: [],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.created_at).toBe(1700000000);
+  });
+
+  test("backfillResponsesFieldsJson backfills missing created_at", () => {
+    const response = {
+      id: "resp_1",
+      object: "response",
+      status: "completed",
+      output: [],
+    };
+    const result = JSON.parse(backfillResponsesFieldsJson(JSON.stringify(response))) as typeof response;
+    expect(result.created_at).toEqual(expect.any(Number));
+    expect(result.created_at).toBeGreaterThan(0);
+  });
+
+  test("backfillResponsesFieldsJson derives incomplete status on message items", () => {
+    const response = {
+      id: "resp_1",
+      object: "response",
+      status: "incomplete",
+      output: [
+        {
+          type: "message",
+          id: "msg_1",
+          role: "assistant",
+          content: [{ type: "output_text", text: "partial" }],
+        },
+      ],
+    };
+    const result = JSON.parse(backfillResponsesFieldsJson(JSON.stringify(response))) as typeof response;
+    expect(result.output[0].status).toBe("incomplete");
+  });
+
+  test("backfills in_progress status on output_item.added message", () => {
+    const event = {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        type: "message",
+        id: "msg_1",
+        role: "assistant",
+        content: [{ type: "output_text", text: "" }],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    // output_item.added means the item is still being generated; marking it "completed"
+    // would misrepresent the stream state to strict clients.
+    expect(parsed.item.status).toBe("in_progress");
+  });
+
+  test("backfills in_progress status on response.created output items", () => {
+    const event = {
+      type: "response.created",
+      sequence_number: 1,
+      response: {
+        id: "resp_1",
+        object: "response",
+        status: "in_progress",
+        model: "grok-4.5",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "output_text", text: "" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.output[0].status).toBe("in_progress");
+  });
+
+  test("backfills in_progress when both response status and item status are absent", () => {
+    // response.created with no status on either the response or the message item:
+    // the event type alone must drive the inference, not a "completed" default.
+    const event = {
+      type: "response.created",
+      sequence_number: 1,
+      response: {
+        id: "resp_1",
+        object: "response",
+        model: "grok-4.5",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "output_text", text: "" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.output[0].status).toBe("in_progress");
+  });
+
+  test("backfills incomplete status on response.incomplete output items", () => {
+    const event = {
+      type: "response.incomplete",
+      sequence_number: 10,
+      response: {
+        id: "resp_1",
+        object: "response",
+        status: "incomplete",
+        model: "grok-4.5",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "output_text", text: "partial" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.output[0].status).toBe("incomplete");
+  });
+
+  test("maps response.failed to incomplete message status", () => {
+    // response.failed carries status: "failed" on the response object, but
+    // OutputMessage.status only accepts in_progress/completed/incomplete.
+    // "failed" means the message did not finish generating, so "incomplete"
+    // is the correct semantic mapping — not "completed", which would falsely
+    // claim the message is whole.
+    const event = {
+      type: "response.failed",
+      sequence_number: 5,
+      response: {
+        id: "resp_1",
+        object: "response",
+        status: "failed",
+        model: "grok-4.5",
+        output: [
+          {
+            type: "message",
+            id: "msg_1",
+            role: "assistant",
+            content: [{ type: "output_text", text: "partial" }],
+          },
+        ],
+      },
+    };
+    const [out] = apply(sseBlock(event));
+    const parsed = parseData([out])[0];
+    expect(parsed.response.output[0].status).toBe("incomplete");
+  });
+
+  test("created_at stays consistent across events in the same stream", () => {
+    // The rewrite factory captures created_at once at creation time; every event in
+    // the same stream must carry the same timestamp, even if the stream spans a
+    // second boundary. This test mocks Date.now to make that guarantee deterministic:
+    // the factory is created at t=1000, and the second event is applied at t=3000.
+    // A per-event implementation would write 3000 for the second event and fail.
+    const originalNow = Date.now;
+    const fakeNow = (ms: number) => () => ms;
+    try {
+      Date.now = fakeNow(1_000);
+      const localRewrite = createResponsesFieldBackfillBlockRewrite();
+      const localApply = (block: string): string[] => [...localRewrite(block)];
+
+      const createdEvent = {
+        type: "response.created",
+        sequence_number: 1,
+        response: {
+          id: "resp_1",
+          object: "response",
+          status: "in_progress",
+          model: "grok-4.5",
+          output: [],
+        },
+      };
+
+      // Advance the clock past a second boundary before applying the second event.
+      Date.now = fakeNow(3_000);
+      const completedEvent = {
+        type: "response.completed",
+        sequence_number: 42,
+        response: {
+          id: "resp_1",
+          object: "response",
+          status: "completed",
+          model: "grok-4.5",
+          output: [
+            {
+              type: "message",
+              id: "msg_1",
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: "answer" }],
+            },
+          ],
+        },
+      };
+
+      const createdOut = parseData(localApply(sseBlock(createdEvent)))[0];
+      const completedOut = parseData(localApply(sseBlock(completedEvent)))[0];
+      // Both events went through the same rewrite factory, so their created_at must
+      // be the factory's capture time (1), not the per-event time (3).
+      expect(createdOut.response.created_at).toBe(1);
+      expect(completedOut.response.created_at).toBe(1);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
   test("the canonical image_generation_call type gets its own prefix", () => {
     const response = {
       id: "resp_1",

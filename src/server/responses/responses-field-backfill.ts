@@ -92,6 +92,29 @@ function nextSyntheticItemSlot(): ItemIdSlot {
 }
 
 /**
+ * Backfill `status` on a message output item if missing.
+ *
+ * The Responses API spec defines `status` as a required field on
+ * `OutputMessage`. Some upstream relays omit it, which causes strict
+ * deserializers (e.g. grok-build's serde types) to fail with
+ * `missing field 'status'`. Only message items carry this field in the
+ * Responses schema; reasoning, function_call, and other item types do not.
+ *
+ * The value is inferred from the event context: `output_item.added` and
+ * `response.created` / `response.in_progress` mean the message is still
+ * being generated (`in_progress`); `output_item.done` and
+ * `response.completed` / `response.incomplete` mean the message is
+ * finalized (`completed` / `incomplete` respectively).
+ *
+ * Returns the same object reference if no change is needed.
+ */
+function backfillItemStatus(item: Record<string, unknown>, inferredStatus: string): Record<string, unknown> {
+  if (item.type !== "message") return item;
+  if ("status" in item) return item;
+  return { ...item, status: inferredStatus };
+}
+
+/**
  * Backfill annotations: [] on an output_text content part if missing.
  * Returns the same object reference if no change is needed.
  */
@@ -122,10 +145,10 @@ function backfillContentArray(content: unknown): unknown {
 
 /**
  * Walk an output item and backfill output_text parts in its content.
- * Also backfills a missing required id on the item itself.
+ * Also backfills a missing required id and status on the item itself.
  * Returns the same object reference if nothing changed.
  */
-function backfillOutputItem(item: unknown, slot: ItemIdSlot): unknown {
+function backfillOutputItem(item: unknown, slot: ItemIdSlot, inferredStatus: string): unknown {
   if (!isPlainObject(item)) return item;
   // The compact wire family is the `/v1/responses/compact` format, not a Responses output item.
   // Those items have no `id` in that contract, so synthesizing one changes a response body the
@@ -136,34 +159,93 @@ function backfillOutputItem(item: unknown, slot: ItemIdSlot): unknown {
   const content = item.content;
   const repaired = backfillContentArray(content);
   const withId = backfillItemId(item, slot);
-  if (repaired === content && withId === item) return item;
-  return { ...withId, ...(repaired === content ? {} : { content: repaired }) };
+  const withStatus = backfillItemStatus(withId, inferredStatus);
+  if (repaired === content && withStatus === item) return item;
+  return { ...withStatus, ...(repaired === content ? {} : { content: repaired }) };
 }
 
 /**
  * Walk a response object's output[] and backfill output_text parts.
+ * Also backfills `created_at` on the response itself when absent.
+ *
+ * `createdAt` is captured once per rewrite factory (SSE) or per call (JSON)
+ * so every event in the same stream carries the same timestamp, even if the
+ * stream spans a second boundary.
+ *
+ * `inferredItemStatus` is the status to backfill on message items that lack
+ * one — derived from the event type so `output_item.added` / `response.created`
+ * gets `in_progress` while `output_item.done` / `response.completed` gets
+ * `completed`.
+ *
  * Returns the same object reference if nothing changed.
  */
-function backfillResponseOutput(response: unknown): unknown {
+function backfillResponseOutput(response: unknown, createdAt: number, inferredItemStatus: string): unknown {
   if (!isPlainObject(response)) return response;
-  const output = response.output;
-  if (!Array.isArray(output)) return response;
+  let current = response;
+
+  // Backfill created_at on the Response object. Strict Responses decoders (e.g. grok-build's
+  // serde types) require `created_at: u64` — no `#[serde(default)]` — so an upstream relay that
+  // omits it causes `missing field 'created_at'`. Use a timestamp captured once per rewrite
+  // factory so every event in the same stream agrees, even if the stream spans a second
+  // boundary.
+  if (!("created_at" in current)) {
+    current = { ...current, created_at: createdAt };
+  }
+
+  const output = current.output;
+  if (!Array.isArray(output)) return current === response ? response : current;
   let changed = false;
   const repaired = output.map((item, idx) => {
     if (!isPlainObject(item)) return item;
-    const next = backfillOutputItem(item, { kind: "index", index: idx });
+    const next = backfillOutputItem(item, { kind: "index", index: idx }, inferredItemStatus);
     if (next !== item) changed = true;
     return next;
   });
-  return changed ? { ...response, output: repaired } : response;
+  if (!changed && current === response) return response;
+  return { ...current, output: repaired };
+}
+
+/**
+ * Infer the status to backfill on a message item from the event type.
+ *
+ * `output_item.added` means the item is still being generated (`in_progress`);
+ * `output_item.done` means it is finalized (`completed`). Response-level events
+ * infer from the response's own status field — which is authoritative when present.
+ * If the response status is also absent, the event type itself determines the phase:
+ * `response.created` / `response.in_progress` → `in_progress`,
+ * `response.completed` → `completed`, `response.incomplete` → `incomplete`.
+ */
+function inferredStatusForEventType(eventType: string): string {
+  if (eventType === "response.output_item.added") return "in_progress";
+  if (eventType === "response.output_item.done") return "completed";
+  if (eventType === "response.created" || eventType === "response.in_progress") return "in_progress";
+  if (eventType === "response.incomplete" || eventType === "response.failed") return "incomplete";
+  return "completed";
+}
+
+/**
+ * Map a response-level lifecycle status to a valid OutputMessage status.
+ *
+ * `OutputMessage.status` accepts only `in_progress`, `completed`, or
+ * `incomplete`. Response-level statuses like `failed` or `cancelled` have no
+ * direct message-level equivalent, but `incomplete` is the correct semantic
+ * mapping: the message did not finish generating. Writing `completed` would
+ * assert something the upstream never claimed — a client branching on
+ * `status === "completed"` would treat a truncated message as whole.
+ */
+function messageStatusFromResponseStatus(status: string): string | null {
+  if (status === "in_progress" || status === "completed" || status === "incomplete") return status;
+  if (status === "failed" || status === "cancelled") return "incomplete";
+  return null;
 }
 
 /**
  * Statelessly rewrite one SSE event: backfill annotations
  * on any output_text content part found in the event payload.
  */
-function rewriteEvent(event: Record<string, unknown>): Record<string, unknown> {
+function rewriteEvent(event: Record<string, unknown>, createdAt: number): Record<string, unknown> {
   const type = typeof event.type === "string" ? event.type : "";
+  const inferredItemStatus = inferredStatusForEventType(type);
   let next = event;
   let changed = false;
 
@@ -177,8 +259,8 @@ function rewriteEvent(event: Record<string, unknown>): Record<string, unknown> {
     // is not recoverable in that case, but a unique id is what strict decoders require, and a
     // well-formed stream still gets the stable index-derived id.
     const item = typeof rawIndex === "number" && Number.isInteger(rawIndex) && rawIndex >= 0
-      ? backfillOutputItem(event.item, { kind: "index", index: rawIndex })
-      : backfillOutputItem(event.item, nextSyntheticItemSlot());
+      ? backfillOutputItem(event.item, { kind: "index", index: rawIndex }, inferredItemStatus)
+      : backfillOutputItem(event.item, nextSyntheticItemSlot(), inferredItemStatus);
     if (item !== event.item) {
       next = { ...next, item };
       changed = true;
@@ -198,7 +280,13 @@ function rewriteEvent(event: Record<string, unknown>): Record<string, unknown> {
   // response.created / in_progress / completed / incomplete / failed:
   // response.output[].content[] -> output_text parts
   if (isPlainObject(event.response)) {
-    const response = backfillResponseOutput(event.response);
+    // For response-level events, prefer the response's own status when it is a valid
+    // OutputMessage status. Response lifecycle statuses like "failed" or "cancelled"
+    // have no message-level equivalent — fall back to the event-type inference instead.
+    const responseStatus = typeof event.response.status === "string"
+      ? messageStatusFromResponseStatus(event.response.status) ?? inferredItemStatus
+      : inferredItemStatus;
+    const response = backfillResponseOutput(event.response, createdAt, responseStatus);
     if (response !== event.response) {
       next = { ...next, response };
       changed = true;
@@ -213,8 +301,13 @@ function rewriteEvent(event: Record<string, unknown>): Record<string, unknown> {
  * on output_text content parts. Unconditional: the field is a required
  * canonical Responses field, so adding it when absent is safe for all
  * clients.
+ *
+ * `created_at` is captured once at factory creation time so every event in
+ * the same stream carries the same timestamp, even if the stream spans a
+ * second boundary.
  */
 export function createResponsesFieldBackfillBlockRewrite(): SseBlockRewrite {
+  const createdAt = Math.floor(Date.now() / 1000);
   const rewrite: SseBlockRewrite = (block: string): readonly string[] => {
     const payload = sseDataPayload(block);
     if (payload === null) return [block];
@@ -225,7 +318,7 @@ export function createResponsesFieldBackfillBlockRewrite(): SseBlockRewrite {
       return [block];
     }
     if (!isPlainObject(event)) return [block];
-    const rewritten = rewriteEvent(event);
+    const rewritten = rewriteEvent(event, createdAt);
     if (rewritten === event) return [block];
     return [replaceSseDataPayload(block, JSON.stringify(rewritten))];
   };
@@ -245,7 +338,13 @@ export function backfillResponsesFieldsJson(payload: string): string {
     return payload;
   }
   if (!isPlainObject(response)) return payload;
-  const repaired = backfillResponseOutput(response);
+  const createdAt = Math.floor(Date.now() / 1000);
+  // For a non-streaming response, derive the item status from the response's own
+  // status field when it is a valid OutputMessage status; fall back to "completed".
+  const inferredItemStatus = typeof response.status === "string"
+    ? messageStatusFromResponseStatus(response.status) ?? "completed"
+    : "completed";
+  const repaired = backfillResponseOutput(response, createdAt, inferredItemStatus);
   if (repaired === response) return payload;
   return JSON.stringify(repaired);
 }
