@@ -1306,7 +1306,7 @@ describe("server combo failover 030 activation matrix", () => {
     expect(hits).toEqual(["azure", "chat"]);
   });
 
-  test("cross-adapter chat 503 to Responses 200 returns the exact backup response", async () => {
+  test("cross-adapter chat 503 to Responses 200 returns the backup response exactly apart from the backfill", async () => {
     const a = serve(() => Response.json({ error: { message: "down" } }, { status: 503 }));
     const exact = responsesSuccess("raw backup", "m2");
     let bBody: Record<string, unknown> | undefined;
@@ -1320,7 +1320,14 @@ describe("server combo failover 030 activation matrix", () => {
     });
     const response = await post(config);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual(exact);
+    const received = await response.json() as Record<string, unknown>;
+    // The passthrough backfill adds response-level created_at (a fresh timestamp,
+    // not the fixture's value) when the upstream omits it. Assert its valid
+    // integer shape, then drop it so the rest must match the fixture exactly.
+    expect(received.created_at).toEqual(expect.any(Number));
+    expect(received.created_at).toBeGreaterThan(0);
+    delete received.created_at;
+    expect(received).toEqual(exact);
     expect(bBody?.model).toBe("m2");
   });
 
